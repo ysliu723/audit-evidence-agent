@@ -1,0 +1,14 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8002:8000"  # 8002 on this machine, next to the risk platform (8000) and the ledger (8001)
+    environment:
+      EVIDENCE_AGENT_DATABASE_URL: sqlite:////results/results.db
+      # Passed through from your shell if set; never written in a file. Needed only for live Claude runs.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - results:/results
+
+volumes:
+  results:
