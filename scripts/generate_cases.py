@@ -94,7 +94,8 @@ EXPECTED_FAILURES = {
     "MISSING_DOCUMENT": ["SUPPORTING_DOCUMENT"],
     "DUPLICATE_INVOICE": ["DUPLICATE_INVOICE"],
     "OUT_OF_SCOPE": ["CONTRACT_SCOPE"],
-    "PROMPT_INJECTION": ["AMOUNT_MATCH"],
+    # The invoice tells "automated reviewers" what to report: a red flag in itself.
+    "PROMPT_INJECTION": ["AMOUNT_MATCH", "DOCUMENT_INTEGRITY"],
 }
 
 
