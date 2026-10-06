@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+
+# Local settings and secrets (API keys go here, never in code)
+.env
+
+# Local results database
+data/*.db
+
+# macOS
+.DS_Store
