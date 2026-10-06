@@ -86,14 +86,17 @@ class ClaudeExtractor:
         self.model = model
         self.effort = effort
 
+    system_prompt = SYSTEM_PROMPT
+    output_schema = EXTRACTION_SCHEMA
+
     def request(self, messages: list[dict]) -> dict:
         return {
             "model": self.model,
             "max_tokens": 16000,
-            "system": [{"type": "text", "text": SYSTEM_PROMPT}],
+            "system": [{"type": "text", "text": self.system_prompt}],
             "tools": TOOLS,
             "messages": messages,
-            "output_config": {"effort": self.effort, "format": {"type": "json_schema", "schema": EXTRACTION_SCHEMA}},
+            "output_config": {"effort": self.effort, "format": {"type": "json_schema", "schema": self.output_schema}},
             "cache_control": {"type": "ephemeral"},  # each turn reuses the cached earlier part of the conversation
             # If a safety classifier declines, the API retries on its recommended fallback model.
             "betas": ["server-side-fallback-2026-07-01"],
@@ -103,7 +106,7 @@ class ClaudeExtractor:
     def extract(self, case: Case) -> ExtractionRun:
         started = time.perf_counter()
         run = ExtractionRun(extraction=Extraction(invoice=None, contract=None, notes=""), model=self.model)
-        messages = [{"role": "user", "content": first_message(case)}]
+        messages = [{"role": "user", "content": self.first_message(case)}]
         try:
             for _ in range(MAX_TURNS):
                 response = self.api.create(**self.request(messages))
@@ -119,7 +122,7 @@ class ClaudeExtractor:
                     messages.append({"role": "user", "content": self._run_tools(content, run)})
                     continue
                 if stop == "end_turn":
-                    run.extraction = parse_extraction(content)
+                    self.finish(run, final_json(content))
                     return run
                 run.error = f"stopped early ({stop})"
                 return run
@@ -130,6 +133,12 @@ class ClaudeExtractor:
             return run
         finally:
             run.seconds = time.perf_counter() - started
+
+    def first_message(self, case: Case) -> str:
+        return first_message(case)
+
+    def finish(self, run: ExtractionRun, answer: dict) -> None:
+        run.extraction = Extraction.model_validate(answer)
 
     def _run_tools(self, content: list[dict], run: ExtractionRun) -> list[dict]:
         """Run every tool call in the turn, and return all their results in one message."""
@@ -166,9 +175,9 @@ def first_message(case: Case) -> str:
     return f"Fiscal year end: {case.fiscal_year_end.isoformat()}\n\nFlagged journal entry:\n{entry}"
 
 
-def parse_extraction(content: list[dict]) -> Extraction:
-    """The final answer: the text block holding JSON in the Extraction schema."""
+def final_json(content: list[dict]) -> dict:
+    """The final answer: the text block holding JSON in the output schema."""
     text = next((block["text"] for block in content if block.get("type") == "text"), None)
     if text is None:
         raise ValueError("the final turn had no text")
-    return Extraction.model_validate(json.loads(text))
+    return json.loads(text)

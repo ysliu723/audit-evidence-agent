@@ -17,3 +17,6 @@ class ExtractionRun:
     seconds: float = 0.0
     model: str | None = None
     error: str | None = None  # set when the extractor gave up, e.g. a refusal or no usable answer
+    # Only for the comparison experiment, where the model also decides the checks itself.
+    model_verdicts: dict[str, str] | None = None  # check code -> PASS / FAIL / UNABLE / NOT_APPLICABLE
+    model_status: str | None = None

@@ -27,6 +27,10 @@ from app.integrity import suspicious_lines
 from app.parsing import normalize_name
 
 LOOKALIKE_SIMILARITY = 0.8
+CHECK_CODES = [
+    "SUPPORTING_DOCUMENT", "DOCUMENT_INTEGRITY", "AMOUNT_MATCH", "CUTOFF",
+    "VENDOR_APPROVED", "BANK_ACCOUNT", "DUPLICATE_INVOICE", "CONTRACT_SCOPE",
+]
 
 
 class Status(StrEnum):
