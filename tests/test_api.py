@@ -28,8 +28,8 @@ def truths():
     return load_ground_truth()
 
 
-def case_for(truths, scenario, layouts=("A", "B")):
-    return next(t.case_id for t in truths.values() if t.scenario == scenario and t.template in layouts)
+def case_for(truths, scenario, layouts="AB"):
+    return next(t.case_id for t in truths.values() if t.scenario == scenario and t.layout in layouts)
 
 
 def test_list_cases(client):
@@ -38,13 +38,13 @@ def test_list_cases(client):
 
 
 def test_vouching_saves_the_result_and_memo(client, truths):
-    case_id = case_for(truths, "BANK_ACCOUNT_CHANGED")
+    case_id = case_for(truths, "changed_bank")
     response = client.post(f"/cases/{case_id}/vouch")
 
     assert response.status_code == 201
     result = response.json()
     assert (result["status"], result["extractor"], result["current_decision"]) == ("EXCEPTION", "rules", None)
-    bank = next(f for f in result["findings"] if f["check"] == "BANK_ACCOUNT")
+    bank = next(f for f in result["findings"] if f["check"] == "VENDOR_IDENTITY")
     assert bank["status"] == "FAIL" and bank["sources"]
     assert any("contact details on file" in step for step in result["memo"]["next_steps"])
     assert client.get(f"/results/{result['id']}").json() == result
@@ -52,7 +52,7 @@ def test_vouching_saves_the_result_and_memo(client, truths):
 
 
 def test_reviews_are_kept_in_order_and_the_latest_one_counts(client, truths):
-    result_id = client.post(f"/cases/{case_for(truths, 'SUPPORTED')}/vouch").json()["id"]
+    result_id = client.post(f"/cases/{case_for(truths, 'supported')}/vouch").json()["id"]
 
     first = client.post(f"/results/{result_id}/reviews", json={"reviewer": "senior1", "decision": "REJECTED",
                                                                 "notes": "Need the PO as well."})
@@ -73,13 +73,13 @@ def test_reviews_are_kept_in_order_and_the_latest_one_counts(client, truths):
     ],
 )
 def test_incomplete_reviews_are_refused(client, truths, body, message):
-    result_id = client.post(f"/cases/{case_for(truths, 'SUPPORTED')}/vouch").json()["id"]
+    result_id = client.post(f"/cases/{case_for(truths, 'supported')}/vouch").json()["id"]
     response = client.post(f"/results/{result_id}/reviews", json=body)
     assert response.status_code == 422 and message in response.json()["detail"]
 
 
 def test_replay_without_recordings_says_how_to_record(client, truths):
-    response = client.post(f"/cases/{case_for(truths, 'SUPPORTED')}/vouch", params={"extractor": "replay"})
+    response = client.post(f"/cases/{case_for(truths, 'supported')}/vouch", params={"extractor": "replay"})
     assert response.status_code == 409 and "record it first" in response.json()["detail"]
 
 
@@ -89,9 +89,9 @@ def test_not_found(client):
 
 
 def test_the_command_line_prints_the_memo(truths, capsys):
-    assert cli(["vouch", case_for(truths, "CUTOFF")]) == 0
+    assert cli(["vouch", case_for(truths, "cutoff")]) == 0
     out = capsys.readouterr().out
-    assert "Status: EXCEPTION" in out and "[FAIL] CUTOFF" in out
+    assert "Status: EXCEPTION" in out and "[FAIL] DATES" in out
 
 
 def test_an_entry_from_the_risk_platform_api_becomes_a_flagged_entry():

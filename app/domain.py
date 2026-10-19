@@ -1,7 +1,11 @@
-"""What the agent works with: a flagged entry, the client's documents, and the vendor master.
+"""What the agent works with: a flagged entry, the case's documents, and the client's master data.
 
-Amounts are Decimal (exact money), dates are date objects. Pydantic checks
-the types when data is loaded from JSON or CSV.
+A case is one flagged journal entry with its own folder of documents: the vendor's invoice, the purchase
+order, the receiving record, and the vendor's contract when there is one. The agent may read only the
+case's own folder. The vendor master, the approval limits, and the paid-invoice register are the client's
+records; code reads them, the model never sees them.
+
+Amounts are Decimal (exact money), dates are date objects. Pydantic checks the types when data is loaded.
 """
 
 from datetime import date
@@ -11,16 +15,10 @@ from enum import StrEnum
 from pydantic import BaseModel
 
 
-class ServiceCategory(StrEnum):
-    TAX_ADVISORY = "TAX_ADVISORY"
-    IT_CONSULTING = "IT_CONSULTING"
-    MARKETING = "MARKETING"
-    LEGAL = "LEGAL"
-    OTHER = "OTHER"
-
-
 class DocumentType(StrEnum):
     INVOICE = "INVOICE"
+    PURCHASE_ORDER = "PURCHASE_ORDER"
+    RECEIVING_RECORD = "RECEIVING_RECORD"
     CONTRACT = "CONTRACT"
 
 
@@ -39,14 +37,20 @@ class FlaggedEntry(BaseModel):
     rule_codes: list[str] = []  # why the risk platform flagged it
 
 
-class Document(BaseModel):
-    """One document in the client's evidence store. Pages are plain text."""
+class DocumentFile(BaseModel):
+    """One document in a case's folder: a PDF on disk."""
 
     document_id: str
     document_type: DocumentType
-    vendor_name: str  # as printed on the document
     title: str
-    pages: list[str]
+    file: str  # path relative to data/evidence/
+
+
+class Case(BaseModel):
+    case_id: str
+    entry: FlaggedEntry
+    fiscal_year_end: date
+    documents: list[DocumentFile]  # the case's folder; the agent's tools cannot reach anything else
 
 
 class Vendor(BaseModel):
@@ -56,7 +60,14 @@ class Vendor(BaseModel):
     name: str
     tax_id: str
     bank_last4: str
-    category: ServiceCategory
+
+
+class Approver(BaseModel):
+    """Who may approve purchase orders, and up to what amount."""
+
+    name: str
+    title: str
+    limit: Decimal
 
 
 class PaidInvoice(BaseModel):
@@ -68,25 +79,13 @@ class PaidInvoice(BaseModel):
     paid_by_entry_id: str
 
 
-class Case(BaseModel):
-    """A flagged entry to vouch, with the answers the evaluation checks against."""
-
-    case_id: str
-    entry: FlaggedEntry
-    fiscal_year_end: date
-
-
 class GroundTruth(BaseModel):
+    """What the evaluation checks against: the expected result of each of the eight checks."""
+
     case_id: str
+    split: str  # "dev" (used while building the prompts) or "heldout" (scored once, at the end)
     scenario: str
-    template: str | None  # which invoice layout the support uses (A, B, C), if any
-    support_document_id: str | None
-    contract_document_id: str | None
-    expected_status: str
-    expected_failures: list[str]  # check codes that must fail
-    vendor_name: str | None = None
-    invoice_number: str | None = None
-    invoice_date: date | None = None
-    total_amount: Decimal | None = None
-    bank_last4: str | None = None
-    service_category: ServiceCategory | None = None
+    layout: str  # the invoice layout: A and B are familiar, C, D, and E appear only in held-out cases
+    unseen_layout: bool
+    expected: dict[str, str]  # check code -> PASS, FAIL, or UNABLE (when the evidence cannot be read)
+    facts: dict  # the true values printed on the documents, for the oracle extractor and for diagnosis

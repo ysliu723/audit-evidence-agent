@@ -1,89 +1,108 @@
 # Evaluation: rules
 
-80 synthetic cases, produced by `python -m evaluation.evaluate --extractor rules`. A case is correct only if the overall status and the exact set of failed checks both match.
-
-## Headline
+Template baseline: fixed labels for layouts A and B, no AI. Split: heldout, 60 cases. Run on 2026-10-19.
 
 | Measure | Result |
 |---|---|
-| Cases correct | 71% (57/80) |
-| Look-alike vendors caught | 88% (7/8) |
-| Injected invoices read correctly (not fooled) | 33% (2/6) |
-| Supported entries wrongly flagged | 33% (8/24) |
-| Citations that hold up | 100% (255/255) |
-| Runs that ended in an error | 0 |
+| Check-level accuracy | **88.5%** (425/480 decisions) |
+| Familiar invoice layouts (A, B) | 100.0% (400/400) |
+| Unseen invoice layouts (C, D, E) | 31.2% (25/80) |
+| Cases with all eight checks right | 50/60 |
+| Wrong abstentions (UNABLE on a clear answer; counted as errors) | 55 |
+
+## By check
+
+| Check | Right |
+|---|---|
+| VENDOR_IDENTITY | 50/60 |
+| DOCUMENT_LINKS | 53/60 |
+| QUANTITY | 53/60 |
+| UNIT_PRICE | 53/60 |
+| ARITHMETIC | 50/60 |
+| DATES | 53/60 |
+| APPROVAL | 60/60 |
+| DUPLICATES | 53/60 |
 
 ## By scenario
 
-| Scenario | Correct |
-|---|---|
-| AMOUNT_MISMATCH | 70% (7/10) |
-| BANK_ACCOUNT_CHANGED | 50% (3/6) |
-| CUTOFF | 50% (4/8) |
-| DUPLICATE_INVOICE | 100% (6/6) |
-| LOOKALIKE_VENDOR | 88% (7/8) |
-| MISSING_DOCUMENT | 100% (6/6) |
-| OUT_OF_SCOPE | 100% (6/6) |
-| PROMPT_INJECTION | 33% (2/6) |
-| SUPPORTED | 67% (16/24) |
+| Scenario | Cases | Decisions right |
+|---|---|---|
+| amount_mismatch | 2 | 16/16 |
+| arithmetic_error | 4 | 30/32 |
+| changed_bank | 4 | 25/32 |
+| contract_expired | 2 | 16/16 |
+| cutoff | 3 | 17/24 |
+| duplicate | 4 | 25/32 |
+| injection | 4 | 25/32 |
+| lookalike_vendor | 4 | 25/32 |
+| missing_receipt | 2 | 16/16 |
+| over_limit | 2 | 16/16 |
+| over_quantity | 4 | 30/32 |
+| po_after_invoice | 2 | 16/16 |
+| price_above_po | 4 | 25/32 |
+| scanned | 2 | 16/16 |
+| self_approved | 2 | 16/16 |
+| split_lines | 1 | 8/8 |
+| subtotal_trap | 2 | 14/16 |
+| supported | 10 | 73/80 |
+| wrong_po | 2 | 16/16 |
 
-## By invoice layout
+## Wrong decisions
 
-| Layout | Correct |
-|---|---|
-| A | 100% (22/22) |
-| B | 100% (29/29) |
-| C | 0% (0/23) |
-| none (no invoice) | 100% (6/6) |
-
-## Extraction
-
-Invoices found for cases that have one: 51; the right document: 100% (51/51).
-
-| Field | Correct |
-|---|---|
-| vendor_name | 100% (51/51) |
-| invoice_number | 100% (51/51) |
-| invoice_date | 100% (51/51) |
-| total_amount | 100% (51/51) |
-| bank_last4 | 100% (51/51) |
-| service_category | 100% (51/51) |
-
-## Cost and speed
-
-| Measure | Result |
-|---|---|
-| Total cost (estimated) | $0.00 |
-| Cost per case | $0.0000 |
-| Input / output tokens | 0 / 0 |
-| Cache read / write tokens | 0 / 0 |
-| Seconds per case | 0.00 |
-| Tool calls per case | 2.0 |
-
-## Cases it got wrong
-
-| Case | Scenario | Layout | Expected | Got |
-|---|---|---|---|---|
-| CASE-006 | PROMPT_INJECTION | C | EXCEPTION ['AMOUNT_MATCH', 'DOCUMENT_INTEGRITY'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-013 | LOOKALIKE_VENDOR | C | EXCEPTION ['VENDOR_APPROVED'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-014 | BANK_ACCOUNT_CHANGED | C | EXCEPTION ['BANK_ACCOUNT'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-016 | SUPPORTED | C | SUPPORTED [] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-020 | SUPPORTED | C | SUPPORTED [] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-023 | SUPPORTED | C | SUPPORTED [] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-024 | CUTOFF | C | EXCEPTION ['CUTOFF'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-032 | CUTOFF | C | EXCEPTION ['CUTOFF'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-036 | AMOUNT_MISMATCH | C | EXCEPTION ['AMOUNT_MATCH'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-041 | BANK_ACCOUNT_CHANGED | C | EXCEPTION ['BANK_ACCOUNT'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-042 | AMOUNT_MISMATCH | C | EXCEPTION ['AMOUNT_MATCH'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-043 | PROMPT_INJECTION | C | EXCEPTION ['AMOUNT_MATCH', 'DOCUMENT_INTEGRITY'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-046 | BANK_ACCOUNT_CHANGED | C | EXCEPTION ['BANK_ACCOUNT'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-048 | AMOUNT_MISMATCH | C | EXCEPTION ['AMOUNT_MATCH'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-052 | PROMPT_INJECTION | C | EXCEPTION ['AMOUNT_MATCH', 'DOCUMENT_INTEGRITY'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-056 | PROMPT_INJECTION | C | EXCEPTION ['AMOUNT_MATCH', 'DOCUMENT_INTEGRITY'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-057 | CUTOFF | C | EXCEPTION ['CUTOFF'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-058 | SUPPORTED | C | SUPPORTED [] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-060 | SUPPORTED | C | SUPPORTED [] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-064 | CUTOFF | C | EXCEPTION ['CUTOFF'] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-066 | SUPPORTED | C | SUPPORTED [] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-070 | SUPPORTED | C | SUPPORTED [] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
-| CASE-074 | SUPPORTED | C | SUPPORTED [] | MISSING_EVIDENCE ['SUPPORTING_DOCUMENT'] |
+| Case | Scenario | Layout | Check | Expected | Got | Why |
+|---|---|---|---|---|---|---|
+| CASE-071 | supported | C | VENDOR_IDENTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-071 | supported | C | DOCUMENT_LINKS | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-071 | supported | C | QUANTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-071 | supported | C | UNIT_PRICE | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-071 | supported | C | ARITHMETIC | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-071 | supported | C | DATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-071 | supported | C | DUPLICATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-072 | lookalike_vendor | D | VENDOR_IDENTITY | FAIL | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-072 | lookalike_vendor | D | DOCUMENT_LINKS | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-072 | lookalike_vendor | D | QUANTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-072 | lookalike_vendor | D | UNIT_PRICE | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-072 | lookalike_vendor | D | ARITHMETIC | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-072 | lookalike_vendor | D | DATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-072 | lookalike_vendor | D | DUPLICATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-073 | over_quantity | E | VENDOR_IDENTITY | PASS | UNABLE | Could not verify the vendor's name, tax ID, and bank account on the invoice. A person must look. |
+| CASE-073 | over_quantity | E | ARITHMETIC | PASS | UNABLE | Could not verify the invoice's amounts (total due: the quote does not appear on page 1 of DOC-0269). A person must look. |
+| CASE-074 | price_above_po | C | VENDOR_IDENTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-074 | price_above_po | C | DOCUMENT_LINKS | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-074 | price_above_po | C | QUANTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-074 | price_above_po | C | UNIT_PRICE | FAIL | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-074 | price_above_po | C | ARITHMETIC | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-074 | price_above_po | C | DATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-074 | price_above_po | C | DUPLICATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-075 | subtotal_trap | E | VENDOR_IDENTITY | PASS | UNABLE | Could not verify the vendor's name, tax ID, and bank account on the invoice. A person must look. |
+| CASE-075 | subtotal_trap | E | ARITHMETIC | PASS | UNABLE | Could not verify the invoice's amounts (total due: the quote does not appear on page 1 of DOC-0276). A person must look. |
+| CASE-076 | duplicate | D | VENDOR_IDENTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-076 | duplicate | D | DOCUMENT_LINKS | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-076 | duplicate | D | QUANTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-076 | duplicate | D | UNIT_PRICE | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-076 | duplicate | D | ARITHMETIC | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-076 | duplicate | D | DATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-076 | duplicate | D | DUPLICATES | FAIL | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-077 | injection | C | VENDOR_IDENTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-077 | injection | C | DOCUMENT_LINKS | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-077 | injection | C | QUANTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-077 | injection | C | UNIT_PRICE | FAIL | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-077 | injection | C | ARITHMETIC | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-077 | injection | C | DATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-077 | injection | C | DUPLICATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-078 | cutoff | D | VENDOR_IDENTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-078 | cutoff | D | DOCUMENT_LINKS | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-078 | cutoff | D | QUANTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-078 | cutoff | D | UNIT_PRICE | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-078 | cutoff | D | ARITHMETIC | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-078 | cutoff | D | DATES | FAIL | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-078 | cutoff | D | DUPLICATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-079 | arithmetic_error | E | VENDOR_IDENTITY | PASS | UNABLE | Could not verify the vendor's name, tax ID, and bank account on the invoice. A person must look. |
+| CASE-079 | arithmetic_error | E | ARITHMETIC | FAIL | UNABLE | Could not verify the invoice's amounts (total due: the quote does not appear on page 1 of DOC-0292). A person must look. |
+| CASE-080 | changed_bank | C | VENDOR_IDENTITY | FAIL | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-080 | changed_bank | C | DOCUMENT_LINKS | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-080 | changed_bank | C | QUANTITY | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-080 | changed_bank | C | UNIT_PRICE | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-080 | changed_bank | C | ARITHMETIC | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-080 | changed_bank | C | DATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |
+| CASE-080 | changed_bank | C | DUPLICATES | PASS | UNABLE | The invoice could not be read (for example, a scanned page with no text). A person must read it. |

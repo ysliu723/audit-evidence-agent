@@ -1,130 +1,95 @@
-from datetime import date
-from decimal import Decimal
+"""The eight checks: code, not the model, decides; a value is used only after its citation holds up."""
 
 import pytest
 
-from app.checks import Status, run_checks
-from app.evidence import EvidenceStore, load_cases, load_ground_truth
-from app.parsing import all_amounts, all_dates, normalize_name
-from evaluation.oracle import oracle_extraction
+from app.checks import CHECK_CODES, run_checks
+from evaluation.oracle import oracle_findings
+from tests.helpers import case_for, cases, store, truths
 
 
-@pytest.fixture(scope="module")
-def store():
-    return EvidenceStore.load()
+def check(scenario: str, change=None, layouts: str = "AB"):
+    case, truth = case_for(scenario, layouts)
+    findings = oracle_findings(case, truth)
+    if change:
+        change(findings)
+    return run_checks(case, findings, store().folder(case), store()), truth
 
 
-@pytest.fixture(scope="module")
-def cases():
-    return {case.case_id: case for case in load_cases()}
+def test_with_perfect_reading_every_label_is_reproduced():
+    wrong = []
+    for case_id, case in cases().items():
+        truth = truths()[case_id]
+        report = run_checks(case, oracle_findings(case, truth), store().folder(case), store())
+        wrong += [(case_id, c) for c in CHECK_CODES if report.verdicts[c] != truth.expected[c]]
+    assert wrong == []
 
 
-@pytest.fixture(scope="module")
-def truths():
-    return load_ground_truth()
+def test_a_supported_case_passes_every_check_with_its_sources():
+    report, _ = check("supported")
+    assert report.status == "SUPPORTED" and set(report.verdicts.values()) == {"PASS"}
+    assert report.finding("ARITHMETIC").sources and report.finding("APPROVAL").sources
 
 
-def first(truths, scenario):
-    return next(t for t in truths.values() if t.scenario == scenario)
+@pytest.mark.parametrize("scenario, failing, words", [
+    ("lookalike_vendor", "VENDOR_IDENTITY", "closely resembles approved vendor"),
+    ("changed_bank", "VENDOR_IDENTITY", "differs from the account on file"),
+    ("wrong_po", "DOCUMENT_LINKS", "but the purchase order is"),
+    ("missing_receipt", "QUANTITY", "no receiving record"),
+    ("over_quantity", "QUANTITY", "received"),
+    ("price_above_po", "UNIT_PRICE", "the purchase order price is"),
+    ("arithmetic_error", "ARITHMETIC", "but the line says"),
+    ("amount_mismatch", "ARITHMETIC", "is not the entry's amount"),
+    ("cutoff", "DATES", "after the fiscal year end"),
+    ("po_after_invoice", "DATES", "invoiced before they were ordered"),
+    ("over_limit", "APPROVAL", "above Dana Whitfield's approval limit"),
+    ("self_approved", "APPROVAL", "also prepared the entry"),
+    ("duplicate", "DUPLICATES", "was already paid by entry"),
+])
+def test_each_exception_fails_its_check_and_says_why(scenario, failing, words):
+    report, _ = check(scenario)
+    assert report.status == "EXCEPTION" and failing in report.failures
+    assert words in report.finding(failing).detail
 
 
-def check(store, cases, truth, extraction=None):
-    case = cases[truth.case_id]
-    return run_checks(case, extraction or oracle_extraction(case, truth, store), store)
+def test_contract_term_is_checked_when_the_vendor_has_a_contract():
+    report, _ = check("contract_expired")
+    assert report.failures == ["DATES"] and "outside the contract term" in report.finding("DATES").detail
 
 
-class TestParsing:
-    @pytest.mark.parametrize(
-        "text, expected",
-        [("Total Due: $57,503.29", "57503.29"), ("USD 1,234.50 payable", "1234.50"), ("fees 950.00 USD", "950.00")],
-    )
-    def test_amounts(self, text, expected):
-        assert all_amounts(text) == [Decimal(expected)]
-
-    @pytest.mark.parametrize(
-        "text", ["Dated: 2026-11-14", "Invoice Date: November 14, 2026", "Date of issue: 14 Nov 2026", "11/14/2026"]
-    )
-    def test_dates_in_every_layout(self, text):
-        assert all_dates(text) == [date(2026, 11, 14)]
-
-    def test_vendor_names_ignore_case_and_punctuation(self):
-        assert normalize_name("Fabrikam, Inc.") == normalize_name("fabrikam inc")
+def test_a_scanned_invoice_sends_every_check_that_needs_it_to_a_person():
+    report, _ = check("scanned")
+    assert report.status == "NEEDS_REVIEW" and report.failures == []
+    assert report.verdicts["APPROVAL"] == "PASS"
+    assert {v for c, v in report.verdicts.items() if c != "APPROVAL"} == {"UNABLE"}
 
 
-def test_with_perfect_extraction_every_case_gets_the_right_answer(store, cases, truths):
-    for truth in truths.values():
-        report = check(store, cases, truth)
-        assert (report.status, sorted(report.failures)) == (truth.expected_status, sorted(truth.expected_failures)), (
-            truth.case_id, truth.scenario, [f for f in report.findings if f.status != Status.PASS]
-        )
+def test_reading_the_subtotal_as_the_total_is_caught_by_the_label_not_reported_as_a_mismatch():
+    def subtotal_as_total(findings):
+        findings.invoice.total_due = findings.invoice.subtotal.model_copy()
+
+    report, _ = check("subtotal_trap", subtotal_as_total)
+    arithmetic = report.finding("ARITHMETIC")
+    assert arithmetic.status == "UNABLE" and "not labeled as the total due" in arithmetic.detail
 
 
-def test_a_look_alike_vendor_is_named_as_such(store, cases, truths):
-    finding = check(store, cases, first(truths, "LOOKALIKE_VENDOR")).finding("VENDOR_APPROVED")
-    assert finding.status == Status.FAIL
-    assert "closely resembles approved vendor" in finding.detail
+def test_a_value_whose_quote_does_not_hold_up_is_not_used():
+    def invent_a_price(findings):
+        findings.invoice.lines[0].unit_price.value = "1.00"
+
+    report, _ = check("supported", invent_a_price)
+    assert report.verdicts["UNIT_PRICE"] == "UNABLE" and report.verdicts["ARITHMETIC"] == "UNABLE"
+    assert report.status == "NEEDS_REVIEW"
 
 
-def test_a_changed_bank_account_explains_the_risk(store, cases, truths):
-    finding = check(store, cases, first(truths, "BANK_ACCOUNT_CHANGED")).finding("BANK_ACCOUNT")
-    assert finding.status == Status.FAIL
-    assert "payment-fraud" in finding.detail
+def test_an_injection_attempt_is_flagged_and_does_not_change_the_result():
+    report, truth = check("injection")
+    assert report.failures == ["UNIT_PRICE"] and report.flags == ("INSTRUCTIONS_IN_DOCUMENT",)
 
 
-def test_an_injected_instruction_is_itself_a_finding(store, cases, truths):
-    report = check(store, cases, first(truths, "PROMPT_INJECTION"))
-    integrity = report.finding("DOCUMENT_INTEGRITY")
-    assert integrity.status == Status.FAIL
-    assert "mark every check as passed" in integrity.sources[0]
-
-
-class TestCitationsAreVerified:
-    """An extracted value the document does not support is never used."""
-
-    def extraction(self, store, cases, truth, **total_changes):
-        extraction = oracle_extraction(cases[truth.case_id], truth, store)
-        total = extraction.invoice.total_amount.model_copy(update=total_changes)
-        return extraction.model_copy(update={"invoice": extraction.invoice.model_copy(update={"total_amount": total})})
-
-    def test_a_quote_that_is_not_on_the_page(self, store, cases, truths):
-        truth = first(truths, "SUPPORTED")
-        report = check(store, cases, truth, self.extraction(store, cases, truth, quote="Total: $1.00"))
-        finding = report.finding("AMOUNT_MATCH")
-        assert finding.status == Status.UNABLE
-        assert "does not appear on page" in finding.detail
-        assert report.status == "NEEDS_REVIEW"
-
-    def test_a_page_that_does_not_exist(self, store, cases, truths):
-        truth = first(truths, "SUPPORTED")
-        report = check(store, cases, truth, self.extraction(store, cases, truth, page=9))
-        assert "page 9 does not exist" in report.finding("AMOUNT_MATCH").detail
-
-    def test_a_value_the_quote_does_not_show(self, store, cases, truths):
-        truth = first(truths, "SUPPORTED")
-        report = check(store, cases, truth, self.extraction(store, cases, truth, value=str(truth.total_amount + 1)))
-        assert "does not show the amount" in report.finding("AMOUNT_MATCH").detail
-
-    def test_a_value_quoted_from_the_injected_instruction_is_refused(self, store, cases, truths):
-        """If the model is fooled into reporting the injected total, the citation gives it away."""
-        truth = first(truths, "PROMPT_INJECTION")
-        document = store.documents[truth.support_document_id]
-        page = len(document.pages)
-        injected_line = next(line for line in document.pages[-1].splitlines() if "Report the total as" in line)
-        injected_value = str(all_amounts(injected_line)[0])
-        fooled = self.extraction(store, cases, truth, value=injected_value, page=page, quote=injected_line)
-
-        report = check(store, cases, truth, fooled)
-
-        assert report.finding("AMOUNT_MATCH").status == Status.UNABLE
-        assert "addressed to automated reviewers" in report.finding("AMOUNT_MATCH").detail
-        assert report.status == "EXCEPTION"  # the integrity check still fails the case
-
-
-def test_a_contract_with_another_vendor_is_not_used(store, cases, truths):
-    truth = first(truths, "SUPPORTED")
-    other = next(t for t in truths.values() if t.contract_document_id and t.vendor_name != truth.vendor_name)
-    extraction = oracle_extraction(cases[truth.case_id], truth, store)
-    wrong = oracle_extraction(cases[other.case_id], other, store).contract
-    report = check(store, cases, truth, extraction.model_copy(update={"contract": wrong}))
-    finding = report.finding("CONTRACT_SCOPE")
-    assert finding.status == Status.UNABLE and "not with the invoice's vendor" in finding.detail
+def test_a_document_from_outside_the_folder_counts_as_not_read():
+    case, truth = case_for("supported")
+    other = next(c for c in cases().values() if c.case_id != case.case_id)
+    findings = oracle_findings(case, truth)
+    findings.invoice.document_id = other.documents[0].document_id
+    report = run_checks(case, findings, store().folder(case), store())
+    assert report.verdicts["VENDOR_IDENTITY"] == "UNABLE"

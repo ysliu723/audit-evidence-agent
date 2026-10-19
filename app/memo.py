@@ -21,22 +21,21 @@ from app.parsing import all_amounts, all_dates
 from app.pipeline import VouchResult
 
 NEXT_STEPS = {
-    "SUPPORTING_DOCUMENT": "Request the supporting invoice from the client; if none exists, treat the entry as unsupported.",
-    "DOCUMENT_INTEGRITY": "Treat the invoice as suspect: confirm it directly with the vendor and inform the engagement lead.",
-    "AMOUNT_MATCH": "Obtain an explanation for the difference, and a corrected invoice or credit note.",
-    "CUTOFF": "Establish when the services were received; if after year end, propose an adjustment to the accrual.",
-    "VENDOR_APPROVED": "Confirm the vendor exists and was approved (tax ID, address, contract) before accepting the invoice.",
-    "BANK_ACCOUNT": "Confirm the bank account change with the vendor using contact details on file, not those on the invoice.",
-    "DUPLICATE_INVOICE": "Trace both payments and request a refund or credit if the invoice was paid twice.",
-    "CONTRACT_SCOPE": "Obtain approval for the work outside the contract, or an amended contract.",
-    "EXTRACTION": "Vouch this entry manually.",
+    "VENDOR_IDENTITY": "Confirm the vendor and its bank account with contact details on file, not those on the "
+                       "invoice, before paying.",
+    "DOCUMENT_LINKS": "Obtain the purchase order and receiving record this invoice belongs to.",
+    "QUANTITY": "Obtain proof the billed quantity was received, or a credit note for the difference.",
+    "UNIT_PRICE": "Obtain approval for the price change, or a credit note for the overcharge.",
+    "ARITHMETIC": "Ask the vendor for a corrected invoice, or explain the difference from the entry.",
+    "DATES": "Establish when the goods were ordered and received; if after year end, propose a cut-off adjustment.",
+    "APPROVAL": "Obtain approval of the purchase order from someone with authority who did not prepare the entry.",
+    "DUPLICATES": "Trace both payments and request a refund or credit if the invoice was paid twice.",
 }
 UNABLE_STEP = "Review the source document by hand: the automated reading could not be verified."
 SUMMARIES = {
-    "SUPPORTED": "The entry is supported by the invoice and passed every check.",
+    "SUPPORTED": "The entry is supported by the invoice, purchase order, and receiving record, and passed every check.",
     "EXCEPTION": "The entry has exceptions that need follow-up before it can be accepted.",
     "NEEDS_REVIEW": "Some checks could not be completed automatically; a reviewer needs to look at the documents.",
-    "MISSING_EVIDENCE": "No invoice supporting the entry was found.",
 }
 DRAFT_SYSTEM_PROMPT = """\
 You draft vouching memos for an auditor. You are given a journal entry, the results of automated checks, and the \
@@ -88,13 +87,13 @@ class Memo:
 def template_memo(result: VouchResult) -> Memo:
     findings, steps = [], []
     for finding in result.report.findings:
-        if finding.status in (Status.PASS, Status.NOT_APPLICABLE):
+        if finding.status == Status.PASS:
             continue
         findings.append(MemoFinding(finding.check, str(finding.status), finding.detail, list(finding.sources)))
         step = NEXT_STEPS[finding.check] if finding.status == Status.FAIL else UNABLE_STEP
         if step not in steps:
             steps.append(step)
-    return Memo(
+    memo = Memo(
         case_id=result.case.case_id,
         entry_id=result.case.entry.entry_id,
         status=result.report.status,
@@ -103,6 +102,10 @@ def template_memo(result: VouchResult) -> Memo:
         next_steps=steps or ["No follow-up needed beyond reviewer sign-off."],
         drafted_by="template",
     )
+    if "INSTRUCTIONS_IN_DOCUMENT" in result.report.flags:
+        memo.warnings.append("A document contains text addressed to automated reviewers. It did not change any check, "
+                             "but treat the document as suspect and confirm it with the vendor.")
+    return memo
 
 
 def draft_memo(result: VouchResult, api: MessagesAPI, model: str = "claude-opus-5-5") -> Memo:
@@ -161,6 +164,7 @@ def facts_text(result: VouchResult) -> str:
         "entry": result.case.entry.model_dump(mode="json"),
         "fiscal_year_end": result.case.fiscal_year_end.isoformat(),
         "overall_status": result.report.status,
+        "flags": list(result.report.flags),
         "checks": [
             {"check": f.check, "status": str(f.status), "detail": f.detail, "sources": list(f.sources)}
             for f in result.report.findings

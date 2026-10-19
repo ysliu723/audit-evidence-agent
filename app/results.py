@@ -1,6 +1,6 @@
 """Saving vouching results and the reviewer's decisions (SQLite by default; no server to run).
 
-    vouch_results   one row per run: status, findings, extraction, memo, cost
+    vouch_results   one row per run: status, check findings, what was extracted, memo, cost
     reviews         one row per review decision; never updated, so the review history stays intact
 
 A result is only final once a person reviews it. The latest review is the
@@ -84,7 +84,7 @@ def save_result(session: Session, result: VouchResult, memo: Memo, extractor: st
         model=result.run.model,
         status=result.report.status,
         findings_json=json.dumps(findings),
-        extraction_json=result.run.extraction.model_dump_json(),
+        extraction_json=result.run.findings.model_dump_json(),
         memo_json=json.dumps(asdict(memo)),
         cost_usd=result.run.cost_usd + memo.cost_usd,
     )

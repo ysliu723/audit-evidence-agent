@@ -2,7 +2,7 @@
 
 import copy
 
-from app.extraction import Extraction
+from app.extraction import Findings
 
 
 class ScriptedAPI:
@@ -21,10 +21,8 @@ USAGE = {"input_tokens": 1000, "output_tokens": 500, "cache_creation_input_token
 
 
 def response(content: list[dict], stop_reason: str, usage: dict | None = None, **extra) -> dict:
-    return {
-        "id": "msg_test", "type": "message", "role": "assistant", "model": "claude-opus-5-5",
-        "content": content, "stop_reason": stop_reason, "usage": usage or dict(USAGE), **extra,
-    }
+    return {"id": "msg_test", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": content,
+            "stop_reason": stop_reason, "usage": usage or dict(USAGE), **extra}
 
 
 def thinking() -> dict:
@@ -38,5 +36,10 @@ def tool_turn(*calls: tuple[str, dict]) -> dict:
     return response([thinking(), *blocks], "tool_use")
 
 
-def final_turn(extraction: Extraction) -> dict:
-    return response([thinking(), {"type": "text", "text": extraction.model_dump_json(), "citations": None}], "end_turn")
+def submit_turn(findings: Findings | dict) -> dict:
+    data = findings.model_dump(mode="json") if isinstance(findings, Findings) else findings
+    return tool_turn(("submit_findings", data))
+
+
+def text_turn(text: str) -> dict:
+    return response([thinking(), {"type": "text", "text": text}], "end_turn")

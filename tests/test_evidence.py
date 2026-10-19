@@ -1,61 +1,41 @@
+"""The case folder and the tools: only the case's own documents, page by page."""
+
+import json
+
 import pytest
 
-from app.evidence import EvidenceStore, UnknownDocument, load_cases, load_ground_truth
+from app.evidence import NO_TEXT, OutOfScope, hits_as_json
+from tests.helpers import case_for, cases, store
 
 
-@pytest.fixture(scope="module")
-def store():
-    return EvidenceStore.load()
+def test_list_documents_shows_only_the_case_folder():
+    case, _ = case_for("supported")
+    listed = store().folder(case).list_documents()
+    assert [d["document_id"] for d in listed] == [d.document_id for d in case.documents]
+    assert all(d["pages"] >= 1 for d in listed)
 
 
-@pytest.fixture(scope="module")
-def truths():
-    return load_ground_truth()
+def test_documents_from_another_case_and_missing_pages_are_refused():
+    case, _ = case_for("supported")
+    other = next(c for c in cases().values() if c.case_id != case.case_id)
+    folder = store().folder(case)
+    with pytest.raises(OutOfScope, match="not one of this case's documents"):
+        folder.read_page(other.documents[0].document_id, 1)
+    with pytest.raises(OutOfScope, match="there is no page 9"):
+        folder.read_page(case.documents[0].document_id, 9)
+    assert folder.page_text(other.documents[0].document_id, 1) is None
 
 
-def test_loads_the_committed_data(store):
-    assert len(store.documents) == 241
-    assert len(store.vendors) == 10
-    assert len(load_cases()) == 80
+def test_a_scanned_page_says_it_cannot_be_read():
+    case, truth = case_for("scanned")
+    assert store().folder(case).read_page(truth.facts["invoice"]["document_id"], 1) == NO_TEXT
 
 
-def test_an_invoice_number_finds_its_invoice_first(store, truths):
-    for truth in truths.values():
-        if truth.invoice_number is None:
-            continue
-        [best, *_] = store.search(f"{truth.vendor_name} {truth.invoice_number}")
-        assert best.document_id == truth.support_document_id
-
-
-def test_a_vendor_search_returns_that_vendors_documents(store):
-    hits = store.search("Northwind Advisory")
-    assert hits
-    assert all("Northwind" in hit.vendor_name for hit in hits)
-
-
-def test_hits_show_the_best_matching_line(store, truths):
-    truth = next(t for t in truths.values() if t.invoice_number)
-    [best, *_] = store.search(truth.invoice_number)
-    assert truth.invoice_number in best.snippet
-
-
-def test_search_results_are_always_in_the_same_order(store):
-    assert store.search("consulting invoice") == store.search("consulting invoice")
-
-
-def test_nothing_matches_nonsense(store):
-    assert store.search("zzzz qqqq") == []
-
-
-def test_read_shows_page_numbers(store, truths):
-    truth = next(t for t in truths.values() if t.template == "B")  # a two-page layout
-    text = store.read(truth.support_document_id)
-    assert text.startswith(f"{truth.support_document_id} | INVOICE")
-    assert "[page 1]" in text and "[page 2]" in text
-    assert store.page_text(truth.support_document_id, 2).startswith("Summary of charges")
-    assert store.page_text(truth.support_document_id, 3) is None
-
-
-def test_reading_an_unknown_document_fails_clearly(store):
-    with pytest.raises(UnknownDocument):
-        store.read("DOC-9999")
+def test_search_finds_the_invoice_by_its_number_and_returns_the_matching_lines():
+    case, truth = case_for("supported")
+    number = truth.facts["invoice"]["invoice_number"]["value"]
+    hits = store().folder(case).search(number)
+    assert hits[0].document_id == truth.facts["invoice"]["document_id"] and hits[0].page == 1
+    assert any(number in line for line in hits[0].lines)
+    with_snippets, without = json.loads(hits_as_json(hits)), json.loads(hits_as_json(hits, snippets=False))
+    assert "lines" in with_snippets[0] and "lines" not in without[0]

@@ -1,41 +1,51 @@
-"""A rule-based extractor with no AI: the baseline Claude has to beat.
+"""The no-AI baseline: templates for the invoice layouts it was written for, and for the client's own forms.
 
-The rules were written for the two invoice layouts seen first (A and B), the
-way an engineer writes regular expressions for the samples at hand. Layout C,
-a letter-style invoice, was deliberately not looked at; the evaluation shows
-what happens when rules meet a layout they were not written for.
+Each template knows a layout's fixed labels ("Invoice No:", "Bill No.", "Amount payable") and reads the
+value next to them, line by line, so every value still comes with its page and exact line and goes through
+the same citation checks as the model's. It reads the two invoice layouts in the dev cases (A and B) and
+the client's purchase orders, receiving reports, and contracts, which always look the same. An invoice in
+any other layout gives it nothing to read, so the checks that need the invoice report UNABLE: this is
+the problem a model that reads the page solves.
 """
 
 import re
 import time
 
-from app.domain import Case, DocumentType, ServiceCategory
-from app.evidence import EvidenceStore
-from app.extraction import Cited, ContractExtraction, Extraction, InvoiceExtraction
-from app.extractors.base import ExtractionRun
-from app.parsing import all_amounts, all_dates, normalize_name
+from app.domain import Case, DocumentType
+from app.evidence import CaseFolder, EvidenceStore
+from app.extraction import (Cited, ContractFindings, Findings, InvoiceFindings, InvoiceLine, PurchaseOrderFindings,
+                            PurchaseOrderLine, ReceiptLine, ReceivingFindings)
+from app.parsing import all_amounts, all_dates
 
-INVOICE_NUMBER_IN_TEXT = re.compile(r"\(([A-Z]{2,3}-\d+)\)")
-FIELDS = {
-    "vendor_name": [r"^TAX INVOICE - (.+)$"],  # layout A has the vendor on the first line instead (see below)
-    "invoice_number": [r"Invoice No\.:\s*(\S+)", r"^Number:\s*(\S+)"],
-    "invoice_date": [r"Invoice Date:\s*(.+)$", r"Date of issue:\s*(.+)$"],
-    "total_amount": [r"Total Due:\s*(.+)$", r"Amount payable:\s*(.+)$"],
-    "bank_last4": [r"account ending (\d{4})"],
-    "service_description": [r"^Description:\s*(.+)$", r"^Services rendered:\s*(.+)$"],
+ROW = re.compile(r"^(?P<description>\S.*?)\s{2,}(?P<quantity>\d+)\s{2,}\$?(?P<unit>[\d,]+\.\d{2})\s{2,}"
+                 r"\$?(?P<amount>[\d,]+\.\d{2})$")
+RECEIPT_ROW = re.compile(r"^(?P<description>\S.*?)\s{2,}(?P<quantity>\d+)$")
+TEMPLATES = {  # field -> the label the layout prints before it
+    "A": {"invoice_number": "Invoice No:", "invoice_date": "Invoice Date:", "po_number": "PO Number:",
+          "tax_id": "Tax ID:", "subtotal": "Subtotal:", "tax": "Tax (", "total_due": "Total Due:",
+          "bank_last4": "Remit to:", "table": "Description"},
+    "B": {"invoice_number": "Bill No.", "invoice_date": "Date:", "po_number": "Your order:",
+          "tax_id": "Vendor tax ID", "subtotal": "Net amount", "tax": "Sales tax", "total_due": "Amount payable",
+          "bank_last4": "Pay to account", "table": "Item"},
 }
-CATEGORY_KEYWORDS = [
-    (ServiceCategory.TAX_ADVISORY, ["tax", "transfer pricing"]),
-    (ServiceCategory.IT_CONSULTING, ["erp", "cloud", "data platform", "information technology", "systems"]),
-    (ServiceCategory.MARKETING, ["campaign", "market research", "launch", "brand", "marketing", "advertising"]),
-    (ServiceCategory.LEGAL, ["contract review", "litigation", "regulatory", "legal"]),
-    (ServiceCategory.OTHER, ["maintenance", "cleaning", "security", "facilities"]),
-]
 
 
-def categories_in(text: str) -> list[ServiceCategory]:
-    lowered = text.lower()
-    return [category for category, keywords in CATEGORY_KEYWORDS if any(k in lowered for k in keywords)]
+class Lines:
+    """A document's lines with their page numbers."""
+
+    def __init__(self, folder: CaseFolder, document_id: str):
+        self.items = [(n, line.strip()) for n, text in enumerate(folder.pages(document_id), start=1)
+                      for line in text.splitlines() if line.strip()]
+
+    def starting(self, label: str) -> tuple[int, str] | None:
+        return next(((n, line) for n, line in self.items if line.startswith(label)), None)
+
+    def after(self, label: str) -> Cited | None:
+        found = self.starting(label)
+        if found is None:
+            return None
+        page, line = found
+        return Cited(value=line[len(label):].strip(), page=page, quote=line)
 
 
 class RuleBasedExtractor:
@@ -44,100 +54,134 @@ class RuleBasedExtractor:
     def __init__(self, store: EvidenceStore):
         self.store = store
 
-    def extract(self, case: Case) -> ExtractionRun:
+    def extract(self, case: Case):
+        from app.extractors.base import ExtractionRun
+
         started = time.perf_counter()
-        calls = []
-        invoice = self._find_invoice(case, calls)
-        contract = self._find_contract(invoice.vendor_name.value if invoice else case.entry.vendor, calls)
-        notes = "" if invoice else "No invoice matching the entry's number or amount was found."
-        extraction = Extraction(invoice=invoice, contract=contract, notes=notes)
-        return ExtractionRun(extraction=extraction, tool_calls=calls, seconds=time.perf_counter() - started)
+        folder = self.store.folder(case)
+        invoices = [self._invoice(folder, d.document_id) for d in folder.of_type(DocumentType.INVOICE)]
+        invoices = [i for i in invoices if i is not None]
+        findings = Findings(invoice=_choose(invoices, case), purchase_order=self._po(folder),
+                            receiving_record=self._receipt(folder), contract=self._contract(folder),
+                            notes="" if invoices else "No invoice in a known layout.")
+        return ExtractionRun(findings=findings, seconds=time.perf_counter() - started)
 
-    def _search(self, query: str, calls: list[dict]):
-        calls.append({"tool": "search_documents", "input": {"query": query}})
-        return self.store.search(query)
-
-    def _find_invoice(self, case: Case, calls: list[dict]) -> InvoiceExtraction | None:
-        entry = case.entry
-        number = INVOICE_NUMBER_IN_TEXT.search(entry.description)
-        if number:
-            # Search can return other invoices with similar numbers: accept only the exact number.
-            for hit in self._search(number.group(1), calls):
-                if hit.document_type == DocumentType.INVOICE:
-                    invoice = self._read_invoice(hit.document_id)
-                    if invoice.invoice_number.value == number.group(1):
-                        return invoice
-            return None
-        # No invoice number: take the vendor's invoice whose total equals the entry amount.
-        for hit in self._search(f"{entry.vendor} {entry.amount:,.2f}", calls):
-            if hit.document_type != DocumentType.INVOICE:
+    def _invoice(self, folder: CaseFolder, document_id: str) -> InvoiceFindings | None:
+        lines = Lines(folder, document_id)
+        for layout, labels in TEMPLATES.items():
+            number = lines.after(labels["invoice_number"])
+            header = lines.starting(labels["table"])
+            if number is None or header is None:
                 continue
-            if normalize_name(hit.vendor_name) != normalize_name(entry.vendor):
-                continue
-            invoice = self._read_invoice(hit.document_id)
-            if invoice.total_amount.value == str(entry.amount):
-                return invoice
-        return None
-
-    def _read_invoice(self, document_id: str) -> InvoiceExtraction:
-        document = self.store.documents[document_id]
-        found = {name: self._match(document.pages, patterns) for name, patterns in FIELDS.items()}
-        if found["vendor_name"] is None:  # layout A: the vendor's name is the first line
-            first_line = document.pages[0].splitlines()[0]
-            found["vendor_name"] = (first_line, 1, first_line)
-        date_hit, total_hit = found["invoice_date"], found["total_amount"]
-        if date_hit:
-            dates = all_dates(date_hit[0])
-            found["invoice_date"] = (dates[0].isoformat(), date_hit[1], date_hit[2]) if dates else None
-        if total_hit:
-            amounts = all_amounts(total_hit[0])
-            found["total_amount"] = (str(amounts[0]), total_hit[1], total_hit[2]) if amounts else None
-        service = found["service_description"]
-        categories = categories_in(service[0]) if service else []
-        return InvoiceExtraction(
-            document_id=document_id,
-            vendor_name=self._cited(found["vendor_name"]),
-            invoice_number=self._cited(found["invoice_number"]),
-            invoice_date=self._cited(found["invoice_date"]),
-            total_amount=self._cited(found["total_amount"]),
-            bank_last4=self._cited(found["bank_last4"]) if found["bank_last4"] else None,
-            service_description=self._cited(service),
-            service_category=categories[0] if categories else ServiceCategory.OTHER,
-        )
-
-    def _find_contract(self, vendor_name: str, calls: list[dict]) -> ContractExtraction | None:
-        for hit in self._search(f"{vendor_name} master services agreement", calls):
-            if hit.document_type != DocumentType.CONTRACT:
-                continue
-            if normalize_name(hit.vendor_name) != normalize_name(vendor_name):
-                continue
-            document = self.store.documents[hit.document_id]
-            scope = self._match(document.pages, [r"(Scope of services\..+)$"])
-            cap = self._match(document.pages, [r"(shall not exceed \$[\d,]+\.\d{2})"])
-            vendor_line = self._match(document.pages, [r"(Between .+)$"])
-            return ContractExtraction(
-                document_id=hit.document_id,
-                vendor_name=Cited(value=vendor_name, page=vendor_line[1], quote=vendor_line[2]),
-                scope=self._cited(scope),
-                scope_categories=categories_in(scope[0]) if scope else [],
-                not_to_exceed=Cited(value=str(all_amounts(cap[0])[0]), page=cap[1], quote=cap[2]) if cap else None,
+            page_one = [line for n, line in lines.items if n == 1]
+            vendor_line = page_one[0] if layout == "A" else page_one[1]
+            date = lines.after(labels["invoice_date"])
+            dates = all_dates(date.value) if date else []
+            rows = [(n, line, ROW.match(line)) for n, line in lines.items]
+            items = []
+            for n, line, match in rows:
+                if match is None:
+                    continue
+                items.append(InvoiceLine(
+                    description=Cited(value=match["description"].strip(), page=n, quote=line),
+                    quantity=Cited(value=match["quantity"], page=n, quote=line),
+                    unit_price=Cited(value=match["unit"].replace(",", ""), page=n, quote=line),
+                    amount=Cited(value=match["amount"].replace(",", ""), page=n, quote=line)))
+            bank = lines.after(labels["bank_last4"])
+            digits = re.search(r"(\d{4})$", bank.value) if bank else None
+            return InvoiceFindings(
+                document_id=document_id,
+                vendor_name=Cited(value=vendor_line, page=1, quote=vendor_line),
+                tax_id=lines.after(labels["tax_id"]),
+                invoice_number=number,
+                invoice_date=Cited(value=dates[0].isoformat(), page=date.page, quote=date.quote) if dates else
+                Cited(value="", page=1, quote=""),
+                po_number=lines.after(labels["po_number"]),
+                bank_last4=Cited(value=digits.group(1), page=bank.page, quote=bank.quote) if digits else None,
+                lines=items,
+                subtotal=_amount(lines.after(labels["subtotal"])),
+                tax=_amount(lines.after(labels["tax"])),
+                total_due=_amount(lines.after(labels["total_due"])) or Cited(value="0", page=1, quote=""),
             )
         return None
 
-    @staticmethod
-    def _match(pages: list[str], patterns: list[str]) -> tuple[str, int, str] | None:
-        """The first (value, page, line) any pattern finds, or None."""
-        for number, page in enumerate(pages, start=1):
-            for line in page.splitlines():
-                for pattern in patterns:
-                    match = re.search(pattern, line)
-                    if match:
-                        return match.group(1).strip(), number, line
-        return None
+    def _po(self, folder: CaseFolder) -> PurchaseOrderFindings | None:
+        documents = folder.of_type(DocumentType.PURCHASE_ORDER)
+        if not documents:
+            return None
+        document_id = documents[0].document_id
+        lines = Lines(folder, document_id)
+        approval = lines.after("Approved by:")
+        items = []
+        for n, line in lines.items:
+            if match := ROW.match(line):
+                items.append(PurchaseOrderLine(description=Cited(value=match["description"].strip(), page=n, quote=line),
+                                               quantity=Cited(value=match["quantity"], page=n, quote=line),
+                                               unit_price=Cited(value=match["unit"].replace(",", ""), page=n,
+                                                                quote=line)))
+        return PurchaseOrderFindings(
+            document_id=document_id, po_number=lines.after("PO Number:"), po_date=_date(lines.after("PO Date:")),
+            vendor_name=lines.after("Vendor:"),
+            approved_by=Cited(value=approval.value.split(",")[0], page=approval.page, quote=approval.quote),
+            lines=items, po_total=_amount(lines.after("PO Total:")))
 
-    @staticmethod
-    def _cited(found: tuple[str, int, str] | None) -> Cited:
-        if found is None:
-            return Cited(value="", page=1, quote="")  # not found: the checks will report UNABLE
-        value, page, line = found
-        return Cited(value=value, page=page, quote=line)
+    def _receipt(self, folder: CaseFolder) -> ReceivingFindings | None:
+        documents = folder.of_type(DocumentType.RECEIVING_RECORD)
+        if not documents:
+            return None
+        document_id = documents[0].document_id
+        lines = Lines(folder, document_id)
+        items = [ReceiptLine(description=Cited(value=m["description"].strip(), page=n, quote=line),
+                             quantity_received=Cited(value=m["quantity"], page=n, quote=line))
+                 for n, line in lines.items if (m := RECEIPT_ROW.match(line)) and not line.startswith("Item")]
+        return ReceivingFindings(document_id=document_id, receipt_number=lines.after("Receipt No:"),
+                                 po_number=lines.after("PO Number:"),
+                                 received_date=_date(lines.after("Date Received:")), lines=items)
+
+    def _contract(self, folder: CaseFolder) -> ContractFindings | None:
+        documents = folder.of_type(DocumentType.CONTRACT)
+        if not documents:
+            return None
+        document_id = documents[0].document_id
+        lines = Lines(folder, document_id)
+        parties, term = lines.after("Between"), lines.after("Term:")
+        vendor = parties.value.split(" and ", 1)[1] if parties else ""
+        dates = all_dates(term.value) if term else []
+        return ContractFindings(
+            document_id=document_id, vendor_name=Cited(value=vendor, page=parties.page, quote=parties.quote),
+            term_start=Cited(value=dates[0].isoformat(), page=term.page, quote=term.quote),
+            term_end=Cited(value=dates[1].isoformat(), page=term.page, quote=term.quote))
+
+
+def _choose(invoices: list[InvoiceFindings], case: Case) -> InvoiceFindings | None:
+    """The invoice whose number is in the entry's description, else the one whose total is the entry amount."""
+    for invoice in invoices:
+        if invoice.invoice_number.value in case.entry.description:
+            return invoice
+    for invoice in invoices:
+        if invoice.total_due.value and _equal(invoice.total_due.value, case.entry.amount):
+            return invoice
+    return invoices[0] if invoices else None
+
+
+def _equal(text: str, amount) -> bool:
+    try:
+        from decimal import Decimal
+
+        return Decimal(text) == amount
+    except ArithmeticError:
+        return False
+
+
+def _amount(cited: Cited | None) -> Cited | None:
+    if cited is None:
+        return None
+    amounts = all_amounts(cited.quote)
+    return Cited(value=str(amounts[-1]), page=cited.page, quote=cited.quote) if amounts else None
+
+
+def _date(cited: Cited | None) -> Cited | None:
+    if cited is None:
+        return None
+    dates = all_dates(cited.quote)
+    return Cited(value=dates[0].isoformat(), page=cited.page, quote=cited.quote) if dates else cited

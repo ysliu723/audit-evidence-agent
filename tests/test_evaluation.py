@@ -1,67 +1,65 @@
+"""Scoring: eight decisions per case, abstaining on a clear answer is wrong, unseen layouts counted apart."""
+
 import json
 
-import pytest
-
-from app.evidence import EvidenceStore, load_cases, load_ground_truth
-from app.extractors.claude_judge import JUDGE_PROMPT, JUDGED_SCHEMA, ClaudeJudgeExtractor
-from app.extractors.rules import RuleBasedExtractor
-from evaluation.evaluate import OracleExtractor, evaluate, main, report
-from evaluation.oracle import oracle_extraction
-from tests.scripted import ScriptedAPI, response, thinking, tool_turn
+from evaluation.compare import compare
+from evaluation.evaluate import OracleExtractor, Scored, accuracy, evaluate, main, report
+from tests.helpers import cases, store, truths
 
 
-@pytest.fixture(scope="module")
-def store():
-    return EvidenceStore.load()
+def heldout():
+    return [c for c in cases().values() if truths()[c.case_id].split == "heldout"]
 
 
-@pytest.fixture(scope="module")
-def cases():
-    return load_cases()
+def test_the_oracle_scores_every_decision():
+    scored = evaluate(heldout(), OracleExtractor(truths()), store(), truths())
+    assert accuracy(scored) == (480, 480)
 
 
-@pytest.fixture(scope="module")
-def truths():
-    return load_ground_truth()
+def test_the_template_baseline_is_perfect_on_familiar_layouts_and_breaks_on_unseen_ones():
+    from app.extractors.rules import RuleBasedExtractor
+
+    scored = evaluate(heldout(), RuleBasedExtractor(store()), store(), truths())
+    familiar = [s for s in scored if not s.truth.unseen_layout]
+    unseen = [s for s in scored if s.truth.unseen_layout]
+    assert accuracy(familiar) == (400, 400) and accuracy(unseen) == (25, 80)
+    assert accuracy(scored) == (425, 480)
+    assert all(s.abstained_wrongly == s.wrong for s in scored)  # it never guesses: every miss is an abstention
+    text = report("rules", scored, "heldout", "Template baseline")
+    assert "| Check-level accuracy | **88.5%** (425/480 decisions) |" in text
+    assert "| Unseen invoice layouts (C, D, E) | 31.2% (25/80) |" in text
 
 
-def test_the_oracle_gets_every_case_right(store, cases, truths):
-    scored = evaluate(cases, truths, OracleExtractor(store, truths), store)
-    assert all(s.correct for s in scored)
-    text = report(scored, "oracle", store)
-    assert "| Cases correct | 100% (80/80) |" in text
-    assert "| Citations that hold up | 100%" in text
+def test_an_abstention_on_a_clear_answer_counts_as_wrong():
+    case = heldout()[0]
+    truth = truths()[case.case_id]
+
+    class Stub:
+        def __init__(self, verdicts):
+            from app.checks import CheckReport, Finding, Status
+            self.report = CheckReport(tuple(Finding(c, Status(v), "") for c, v in verdicts.items()), "NEEDS_REVIEW")
+            from app.extractors.base import ExtractionRun
+            from app.extraction import Findings
+            self.run = ExtractionRun(findings=Findings(invoice=None, purchase_order=None, receiving_record=None,
+                                                       contract=None, notes=""))
+
+    abstaining = Scored(truth, Stub({c: "UNABLE" for c in truth.expected}))
+    expected_unable = sum(v == "UNABLE" for v in truth.expected.values())
+    assert len(abstaining.wrong) == 8 - expected_unable == len(abstaining.abstained_wrongly)
 
 
-def test_the_rules_baseline_breaks_on_the_unseen_layout(store, cases, truths):
-    scored = evaluate(cases, truths, RuleBasedExtractor(store), store)
-    text = report(scored, "rules", store)
-    assert "| A | 100% (22/22) |" in text and "| B | 100% (29/29) |" in text
-    assert "| C | 0% (0/23) |" in text
-    assert "## Cases it got wrong" in text
+def test_a_live_run_needs_confirmation(capsys):
+    assert main(["--extractor", "claude", "--cases", "2"]) == 2
+    assert "costs money" in capsys.readouterr().out
 
 
-def test_a_live_run_needs_confirmation_and_makes_no_call_without_it(capsys):
-    assert main(["--extractor", "claude", "--cases", "3"]) == 2
-    assert "Add --yes" in capsys.readouterr().err
-
-
-def test_the_judge_variant_gets_the_tools_and_the_registers(store, cases, truths):
-    truth = next(t for t in truths.values() if t.scenario == "DUPLICATE_INVOICE")
-    case = next(c for c in cases if c.case_id == truth.case_id)
-    extraction = oracle_extraction(case, truth, store).model_dump(mode="json")
-    verdicts = [{"check": "DUPLICATE_INVOICE", "status": "FAIL", "reason": "already paid"},
-                {"check": "AMOUNT_MATCH", "status": "PASS", "reason": "equal"}]
-    text = json.dumps({**extraction, "verdicts": verdicts, "overall_status": "EXCEPTION"})
-    answer = response([thinking(), {"type": "text", "text": text}], "end_turn")
-    api = ScriptedAPI([tool_turn(("search_documents", {"query": truth.invoice_number})), answer])
-
-    [scored] = evaluate([case], truths, ClaudeJudgeExtractor(store, api), store)
-
-    first = api.requests[0]
-    assert "Paid-invoice register" in first["messages"][0]["content"]
-    assert "Vendor master" in first["messages"][0]["content"]
-    assert first["output_config"]["format"]["schema"] == JUDGED_SCHEMA
-    assert "Do not decide" not in JUDGE_PROMPT
-    assert (scored.status, scored.failures) == ("EXCEPTION", ["DUPLICATE_INVOICE"])  # the model's verdicts are scored
-    assert scored.correct
+def test_two_runs_are_compared_on_accuracy_cost_and_latency():
+    record = {"case_id": "CASE-001", "expected": {"A": "PASS", "B": "PASS"}, "wrong": [], "input_tokens": 1000,
+              "cache_read_tokens": 0, "cache_write_tokens": 0}
+    first = [{**record, "case_id": f"CASE-{n}", "cost_usd": 0.10, "seconds": 30.0 + n} for n in range(10)]
+    second = [{**record, "case_id": f"CASE-{n}", "cost_usd": 0.08, "seconds": 20.0 + n, "input_tokens": 600}
+              for n in range(10)]
+    table = compare(first, second, ("claude-baseline", "claude-optimized"))
+    assert "| Mean cost per case | $0.1000 | $0.0800 | -20% |" in table
+    assert "| Median latency | 34.5 s | 24.5 s | -29% |" in table
+    assert json.dumps(first)  # records are plain JSON

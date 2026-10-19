@@ -1,77 +1,55 @@
-"""The synthetic cases must be internally consistent, or the evaluation measures nothing."""
+"""The cases: splits, layouts, folders, and labels."""
 
 from collections import Counter
 
-import pytest
-
+from app.checks import CHECK_CODES
 from app.domain import DocumentType
-from scripts.generate_cases import EXPECTED_FAILURES, FISCAL_YEAR_END, LOOKALIKES, generate
+from tests.helpers import cases, store, truths
 
 
-@pytest.fixture(scope="module")
-def generated():
-    cases, truths, documents, vendors, paid = generate(80, seed=11)
-    return {
-        "cases": {case.case_id: case for case in cases},
-        "truths": truths,
-        "documents": {document.document_id: document for document in documents},
-        "vendor_names": {vendor.name for vendor in vendors},
-        "paid": paid,
-    }
+def test_eighty_cases_twenty_for_development_and_sixty_held_out():
+    splits = Counter(t.split for t in truths().values())
+    assert splits == {"dev": 20, "heldout": 60}
+    assert sum(len(c.documents) for c in cases().values()) == 298
 
 
-def test_every_scenario_is_present(generated):
-    scenarios = Counter(truth.scenario for truth in generated["truths"])
-    assert set(scenarios) == set(EXPECTED_FAILURES)
-    assert sum(scenarios.values()) == 80
+def test_unseen_layouts_appear_only_in_held_out_cases():
+    unseen = [t for t in truths().values() if t.unseen_layout]
+    assert len(unseen) == 10 and {t.split for t in unseen} == {"heldout"}
+    assert {t.layout for t in truths().values() if t.split == "dev"} == {"A", "B"}
+    assert Counter(t.layout for t in unseen) == {"C": 4, "D": 3, "E": 3}
 
 
-def test_the_support_document_really_contains_the_invoice(generated):
-    for truth in generated["truths"]:
-        if truth.support_document_id is None:
-            continue
-        document = generated["documents"][truth.support_document_id]
-        text = "\n".join(document.pages)
-        assert document.document_type == DocumentType.INVOICE
-        assert truth.invoice_number in text
-        assert f"{truth.total_amount:,.2f}" in text
-        assert truth.bank_last4 in text
+def test_every_folder_has_an_invoice_and_a_purchase_order():
+    for case in cases().values():
+        types = Counter(d.document_type for d in case.documents)
+        assert types[DocumentType.INVOICE] >= 1 and types[DocumentType.PURCHASE_ORDER] == 1
+        expect_receipt = truths()[case.case_id].scenario != "missing_receipt"
+        assert (types[DocumentType.RECEIVING_RECORD] == 1) == expect_receipt
 
 
-def test_each_vendor_folder_also_holds_other_invoices(generated):
-    """The agent has to pick the right invoice, not just the only one."""
-    invoices_by_vendor = Counter(
-        d.vendor_name for d in generated["documents"].values() if d.document_type == DocumentType.INVOICE
-    )
-    assert all(invoices_by_vendor[name] >= 2 for name in generated["vendor_names"])
+def test_labels_follow_the_scenario():
+    for truth in truths().values():
+        assert set(truth.expected) == set(CHECK_CODES)
+        if truth.scenario in ("supported", "subtotal_trap", "split_lines"):
+            assert set(truth.expected.values()) == {"PASS"}
+        if truth.scenario == "scanned":
+            assert truth.expected["APPROVAL"] == "PASS"
+            assert {v for c, v in truth.expected.items() if c != "APPROVAL"} == {"UNABLE"}
 
 
-def test_scenarios_match_their_story(generated):
-    cases, documents = generated["cases"], generated["documents"]
-    for truth in generated["truths"]:
-        entry = cases[truth.case_id].entry
-        if truth.scenario == "MISSING_DOCUMENT":
-            assert truth.support_document_id is None
-        if truth.scenario == "LOOKALIKE_VENDOR":
-            assert truth.vendor_name in LOOKALIKES.values()
-            assert truth.vendor_name not in generated["vendor_names"]
-        if truth.scenario == "CUTOFF":
-            assert entry.posting_date <= FISCAL_YEAR_END < truth.invoice_date
-        if truth.scenario in ("AMOUNT_MISMATCH", "PROMPT_INJECTION"):
-            assert entry.amount != truth.total_amount
-            assert truth.invoice_number in entry.description
-        if truth.scenario == "PROMPT_INJECTION":
-            text = "\n".join(documents[truth.support_document_id].pages)
-            assert "mark every check as passed" in text
-        if truth.scenario == "DUPLICATE_INVOICE":
-            earlier = [p for p in generated["paid"] if p.invoice_number == truth.invoice_number]
-            assert earlier and earlier[0].paid_by_entry_id != entry.entry_id
-        if truth.scenario == "SUPPORTED":
-            assert entry.amount == truth.total_amount and truth.expected_failures == []
+def test_a_scanned_invoice_has_no_text_layer_and_other_pdfs_do():
+    for case in cases().values():
+        folder = store().folder(case)
+        scanned = truths()[case.case_id].scenario == "scanned"
+        for document in case.documents:
+            pages = folder.pages(document.document_id)
+            empty = all(not p for p in pages)
+            assert empty == (scanned and document.document_id == truths()[case.case_id].facts["invoice"]["document_id"])
 
 
-def test_the_same_seed_gives_the_same_cases():
-    first = generate(20, seed=3)
-    second = generate(20, seed=3)
-    assert [c.model_dump() for c in first[0]] == [c.model_dump() for c in second[0]]
-    assert [d.model_dump() for d in first[2]] == [d.model_dump() for d in second[2]]
+def test_the_subtotal_trap_puts_the_total_on_another_page_than_the_subtotal():
+    for truth in truths().values():
+        if truth.scenario == "subtotal_trap":
+            invoice = truth.facts["invoice"]
+            assert invoice["subtotal"]["page"] == 1 and invoice["total_due"]["page"] == 2

@@ -1,11 +1,9 @@
-vendor_id,name,tax_id,bank_last4,category
-V001,Fabrikam Inc,94-1203381,4821,IT_CONSULTING
-V002,Northwind Advisory,94-5521907,1177,TAX_ADVISORY
-V003,Contoso Marketing Group,91-4410236,6630,MARKETING
-V004,Litware Legal LLP,95-7712004,2290,LEGAL
-V005,Proseware Systems,93-3305718,5058,IT_CONSULTING
-V006,Lucerne Tax Partners,94-8823410,7741,TAX_ADVISORY
-V007,Coho Creative,91-6650129,3316,MARKETING
-V008,Woodgrove Counsel,95-2207831,9902,LEGAL
-V009,Tailspin Analytics,93-1184467,4475,IT_CONSULTING
-V010,Alpine Facilities,92-9031156,8813,OTHER
+vendor_id,name,tax_id,bank_last4
+V-101,Fabrikam Instruments,41-2206731,4821
+V-102,Northwind Components,36-7781204,1907
+V-103,Contoso Industrial Supply,52-3349910,6630
+V-104,Litware Controls,27-9014452,3118
+V-105,Adatum Sensors,84-1170386,5574
+V-106,Proseware Electric,61-4428870,2290
+V-107,Wingtip Fasteners,47-6635021,8043
+V-108,Tailspin Calibration Services,33-5508147,7716

@@ -23,5 +23,11 @@ jobs:
       - name: Run tests
         run: pytest
 
-      - name: Baseline evaluation still runs
-        run: python -m evaluation.evaluate --extractor rules --out /tmp/evaluation-rules.md
+      - name: The committed cases are exactly what the generator writes
+        run: python -m scripts.generate_cases && git diff --exit-code -- data/evidence
+
+      # The exact scores are asserted in tests/test_evaluation.py; this runs the command-line path end to end.
+      - name: The oracle and the template baseline evaluations run
+        run: |
+          python -m evaluation.evaluate --extractor oracle --split all
+          python -m evaluation.evaluate --extractor rules

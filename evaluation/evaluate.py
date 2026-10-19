@@ -1,34 +1,48 @@
-"""Measure an extractor on the labeled cases.
+"""Measure an extractor on the labeled cases, check by check.
 
-    python -m evaluation.evaluate --extractor rules             # no AI: the baseline
-    python -m evaluation.evaluate --extractor oracle            # perfect extraction: what the checks can reach
-    python -m evaluation.evaluate --extractor claude --replay   # from data/recordings/, no API key needed
-    python -m evaluation.evaluate --extractor claude --record --yes        # live: costs money, saves recordings
-    python -m evaluation.evaluate --extractor claude-judge --record --yes  # the model also decides the checks
+    python -m evaluation.evaluate --extractor oracle                     # perfect reading: what the checks reach
+    python -m evaluation.evaluate --extractor rules                      # the template baseline, no AI
+    python -m evaluation.evaluate --extractor claude --split dev --cases 5 --record --yes   # live: costs money
+    python -m evaluation.evaluate --extractor claude --record --yes      # all 60 held-out cases, live
+    python -m evaluation.evaluate --extractor claude --replay            # again from the recordings, free
+    python -m evaluation.evaluate --extractor claude --profile baseline --record --yes      # the other retrieval profile
 
-Writes docs/evaluation-<extractor>.md. A case counts as correct only if the
-overall status AND the exact set of failed checks match the ground truth.
+Each held-out case has eight checks, so 60 cases give 480 decisions. A decision is right only if the check's
+result equals the label: PASS, FAIL, or UNABLE. Answering UNABLE (abstaining) when the evidence was clear
+counts as wrong; abstaining is right only where the label says the evidence cannot be read (a scanned invoice).
+
+Writes docs/evaluation-<name>.md and docs/results/<name>.json (one record per case, with cost and latency),
+which evaluation/compare.py reads to compare two runs.
 """
 
 import argparse
+import json
+import statistics
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
-from app.checks import CheckReport, Finding, Status
-from app.citations import citation_problem
+from app.checks import CHECK_CODES
 from app.domain import Case, GroundTruth
 from app.evidence import EvidenceStore, load_cases, load_ground_truth
 from app.extractors.base import ExtractionRun
-from app.parsing import normalize_name
 from app.pipeline import VouchResult, vouch
-from evaluation.oracle import oracle_extraction
+from evaluation.oracle import oracle_findings
 
-# A rough guide for the live-run warning, from the size of the cases (about 3-5 turns each); measure to be sure.
-ESTIMATED_COST_PER_CASE = {"claude": (0.05, 0.25), "claude-judge": (0.08, 0.35)}
-FIELDS = ["vendor_name", "invoice_number", "invoice_date", "total_amount", "bank_last4"]
+ROOT = Path(__file__).resolve().parent.parent
+ESTIMATED_COST_PER_CASE = (0.05, 0.30)  # US dollars, a rough guide for the warning before a live run
+
+
+class OracleExtractor:
+    name = "oracle"
+
+    def __init__(self, truths: dict[str, GroundTruth]):
+        self.truths = truths
+
+    def extract(self, case: Case) -> ExtractionRun:
+        return ExtractionRun(findings=oracle_findings(case, self.truths[case.case_id]))
 
 
 @dataclass
@@ -37,216 +51,145 @@ class Scored:
     result: VouchResult
 
     @property
-    def status(self) -> str:
-        return self.result.report.status
+    def verdicts(self) -> dict[str, str]:
+        return self.result.report.verdicts
 
     @property
-    def failures(self) -> list[str]:
-        return sorted(self.result.report.failures)
+    def wrong(self) -> list[str]:
+        return [c for c in CHECK_CODES if self.verdicts.get(c) != self.truth.expected[c]]
 
     @property
-    def correct(self) -> bool:
-        return self.status == self.truth.expected_status and self.failures == sorted(self.truth.expected_failures)
+    def abstained_wrongly(self) -> list[str]:
+        return [c for c in self.wrong if self.verdicts.get(c) == "UNABLE"]
+
+    def record(self) -> dict:
+        run = self.result.run
+        return {"case_id": self.truth.case_id, "split": self.truth.split, "scenario": self.truth.scenario,
+                "layout": self.truth.layout, "unseen_layout": self.truth.unseen_layout,
+                "expected": self.truth.expected, "verdicts": self.verdicts, "wrong": self.wrong,
+                "status": self.result.report.status, "error": run.error, "model": run.model,
+                "model_calls": run.model_calls, "tool_calls": len(run.tool_calls),
+                "refused_calls": run.refused_calls, "corrections": run.corrections,
+                "input_tokens": run.input_tokens, "output_tokens": run.output_tokens,
+                "cache_read_tokens": run.cache_read_tokens, "cache_write_tokens": run.cache_write_tokens,
+                "cost_usd": round(run.cost_usd, 6), "seconds": round(run.seconds, 3)}
 
 
-class OracleExtractor:
-    name = "oracle"
-
-    def __init__(self, store: EvidenceStore, truths: dict[str, GroundTruth]):
-        self.store, self.truths = store, truths
-
-    def extract(self, case: Case) -> ExtractionRun:
-        return ExtractionRun(extraction=oracle_extraction(case, self.truths[case.case_id], self.store))
-
-
-def judged_result(result: VouchResult) -> VouchResult:
-    """For the comparison experiment: score the model's own verdicts instead of the code's checks."""
-    run = result.run
-    if run.error or run.model_verdicts is None:
-        return result
-    findings = tuple(Finding(check, Status(status), "decided by the model") for check, status in run.model_verdicts.items())
-    return VouchResult(case=result.case, run=run, report=CheckReport(findings, run.model_status or "NEEDS_REVIEW"))
-
-
-def evaluate(cases: list[Case], truths: dict[str, GroundTruth], extractor, store: EvidenceStore) -> list[Scored]:
+def evaluate(cases: list[Case], extractor, store: EvidenceStore, truths: dict[str, GroundTruth]) -> list[Scored]:
     scored = []
     for case in cases:
-        result = vouch(case, extractor, store)
-        if extractor.name == "claude-judge":
-            result = judged_result(result)
-        scored.append(Scored(truths[case.case_id], result))
+        scored.append(Scored(truths[case.case_id], vouch(case, extractor, store)))
+        print(f"  {case.case_id}  {len(CHECK_CODES) - len(scored[-1].wrong)}/{len(CHECK_CODES)}", file=sys.stderr)
     return scored
 
 
+def accuracy(scored: list[Scored]) -> tuple[int, int]:
+    total = len(scored) * len(CHECK_CODES)
+    return total - sum(len(s.wrong) for s in scored), total
+
+
 def percent(part: int, whole: int) -> str:
-    return f"{100 * part / whole:.0f}% ({part}/{whole})" if whole else "-"
+    return f"{100 * part / whole:.1f}%" if whole else "n/a"
 
 
-def table(headers: list[str], rows: list[list[str]]) -> str:
-    return "\n".join(["| " + " | ".join(headers) + " |", "|" + "---|" * len(headers)]
-                     + ["| " + " | ".join(row) + " |" for row in rows])
-
-
-def field_value(truth: GroundTruth, name: str) -> str | None:
-    value = getattr(truth, name)
-    return None if value is None else (value.isoformat() if isinstance(value, date) else str(value))
-
-
-def report(scored: list[Scored], extractor_name: str, store: EvidenceStore) -> str:
-    total = len(scored)
-    correct = sum(s.correct for s in scored)
-
-    by_scenario, by_layout = defaultdict(list), defaultdict(list)
-    for s in scored:
-        by_scenario[s.truth.scenario].append(s.correct)
-        by_layout[s.truth.template or "none (no invoice)"].append(s.correct)
-
-    found = right_document = 0
-    field_right, field_total = Counter(), Counter()
-    citations_ok = citations_total = 0
-    for s in scored:
-        invoice = s.result.run.extraction.invoice
-        if s.truth.support_document_id is None or invoice is None:
-            continue
-        found += 1
-        right_document += invoice.document_id == s.truth.support_document_id
-        for name in FIELDS:
-            cited = getattr(invoice, name)
-            expected = field_value(s.truth, name)
-            if expected is None:
-                continue
-            field_total[name] += 1
-            got = cited.value if cited else None
-            if name == "vendor_name":
-                field_right[name] += got is not None and normalize_name(got) == normalize_name(expected)
-            else:
-                field_right[name] += got == expected
-            if cited is not None:
-                citations_total += 1
-                kind = {"invoice_date": "date", "total_amount": "amount"}.get(name, "text")
-                citations_ok += citation_problem(store, invoice.document_id, cited, kind) is None
-        field_total["service_category"] += 1
-        field_right["service_category"] += invoice.service_category == s.truth.service_category
-
-    lookalikes = [s for s in scored if s.truth.scenario == "LOOKALIKE_VENDOR"]
-    caught = sum("VENDOR_APPROVED" in s.failures for s in lookalikes)
-    injections = [s for s in scored if s.truth.scenario == "PROMPT_INJECTION"]
-    not_fooled = sum(
-        s.result.run.extraction.invoice is not None
-        and s.result.run.extraction.invoice.total_amount.value == str(s.truth.total_amount)
-        for s in injections
-    )
-    supported = [s for s in scored if s.truth.scenario == "SUPPORTED"]
-    false_alarms = sum(s.status != "SUPPORTED" for s in supported)
-
+def report(name: str, scored: list[Scored], split: str, details: str) -> str:
+    right, total = accuracy(scored)
+    familiar = [s for s in scored if not s.truth.unseen_layout]
+    unseen = [s for s in scored if s.truth.unseen_layout]
+    f_right, f_total = accuracy(familiar)
+    u_right, u_total = accuracy(unseen)
+    whole_cases = sum(1 for s in scored if not s.wrong)
+    abstentions = sum(len(s.abstained_wrongly) for s in scored)
+    out = [f"# Evaluation: {name}", "", f"{details}. Split: {split}, {len(scored)} cases. Run on {date.today()}.", "",
+           "| Measure | Result |", "|---|---|",
+           f"| Check-level accuracy | **{percent(right, total)}** ({right}/{total} decisions) |",
+           f"| Familiar invoice layouts (A, B) | {percent(f_right, f_total)} ({f_right}/{f_total}) |",
+           f"| Unseen invoice layouts (C, D, E) | {percent(u_right, u_total)} ({u_right}/{u_total}) |",
+           f"| Cases with all eight checks right | {whole_cases}/{len(scored)} |",
+           f"| Wrong abstentions (UNABLE on a clear answer; counted as errors) | {abstentions} |"]
     runs = [s.result.run for s in scored]
-    cost = sum(r.cost_usd for r in runs)
-    errors = Counter(r.error for r in runs if r.error)
-    lines = [
-        f"# Evaluation: {extractor_name}",
-        "",
-        f"{total} synthetic cases, produced by `python -m evaluation.evaluate --extractor {extractor_name}`. "
-        "A case is correct only if the overall status and the exact set of failed checks both match.",
-        "",
-        "## Headline",
-        "",
-        table(["Measure", "Result"], [
-            ["Cases correct", percent(correct, total)],
-            ["Look-alike vendors caught", percent(caught, len(lookalikes))],
-            ["Injected invoices read correctly (not fooled)", percent(not_fooled, len(injections))],
-            ["Supported entries wrongly flagged", percent(false_alarms, len(supported))],
-            ["Citations that hold up", percent(citations_ok, citations_total)],
-            ["Runs that ended in an error", str(sum(errors.values()))],
-        ]),
-        "",
-        "## By scenario",
-        "",
-        table(["Scenario", "Correct"], [[name, percent(sum(v), len(v))] for name, v in sorted(by_scenario.items())]),
-        "",
-        "## By invoice layout",
-        "",
-        table(["Layout", "Correct"], [[name, percent(sum(v), len(v))] for name, v in sorted(by_layout.items())]),
-        "",
-        "## Extraction",
-        "",
-        f"Invoices found for cases that have one: {found}; the right document: {percent(right_document, found)}.",
-        "",
-        table(["Field", "Correct"], [[name, percent(field_right[name], field_total[name])]
-                                     for name in [*FIELDS, "service_category"]]),
-        "",
-        "## Cost and speed",
-        "",
-        table(["Measure", "Result"], [
-            ["Total cost (estimated)", f"${cost:.2f}"],
-            ["Cost per case", f"${cost / total:.4f}" if total else "-"],
-            ["Input / output tokens", f"{sum(r.input_tokens for r in runs):,} / {sum(r.output_tokens for r in runs):,}"],
-            ["Cache read / write tokens",
-             f"{sum(r.cache_read_tokens for r in runs):,} / {sum(r.cache_write_tokens for r in runs):,}"],
-            ["Seconds per case", f"{sum(r.seconds for r in runs) / total:.2f}" if total else "-"],
-            ["Tool calls per case", f"{sum(len(r.tool_calls) for r in runs) / total:.1f}" if total else "-"],
-        ]),
-    ]
+    if any(r.model_calls for r in runs):
+        costs = [r.cost_usd for r in runs]
+        seconds = sorted(r.seconds for r in runs)
+        p95 = seconds[min(len(seconds) - 1, int(round(0.95 * (len(seconds) - 1))))]
+        out += [f"| Mean cost per case | ${statistics.mean(costs):.4f} (total ${sum(costs):.2f}; estimate from token "
+                "counts and list prices) |",
+                f"| Latency per case | median {statistics.median(seconds):.1f} s, p95 {p95:.1f} s |",
+                f"| Model calls per case | mean {statistics.mean(r.model_calls for r in runs):.1f} |",
+                f"| Citations sent back for correction | {sum(sum(r.corrections.values()) for r in runs)} |",
+                f"| Tool calls refused by the backend | {sum(len(r.refused_calls) for r in runs)} |",
+                f"| Runs that stopped early (go to a person) | {sum(1 for r in runs if r.error)} |"]
+    out += ["", "## By check", "", "| Check | Right |", "|---|---|"]
+    for check in CHECK_CODES:
+        hits = sum(1 for s in scored if check not in s.wrong)
+        out.append(f"| {check} | {hits}/{len(scored)} |")
+    out += ["", "## By scenario", "", "| Scenario | Cases | Decisions right |", "|---|---|---|"]
+    by_scenario: dict[str, list[Scored]] = defaultdict(list)
+    for s in scored:
+        by_scenario[s.truth.scenario].append(s)
+    for scenario, group in sorted(by_scenario.items()):
+        g_right, g_total = accuracy(group)
+        out.append(f"| {scenario} | {len(group)} | {g_right}/{g_total} |")
+    mistakes = [(s, c) for s in scored for c in s.wrong]
+    if mistakes:
+        out += ["", "## Wrong decisions", "", "| Case | Scenario | Layout | Check | Expected | Got | Why |",
+                "|---|---|---|---|---|---|---|"]
+        for s, check in mistakes:
+            detail = s.result.report.finding(check).detail.replace("|", "/")[:140]
+            out.append(f"| {s.truth.case_id} | {s.truth.scenario} | {s.truth.layout} | {check} | "
+                       f"{s.truth.expected[check]} | {s.verdicts[check]} | {detail} |")
+    errors = Counter(s.result.run.error for s in scored if s.result.run.error)
     if errors:
-        lines += ["", "Errors: " + "; ".join(f"{error} ({count})" for error, count in errors.most_common())]
-    wrong = [s for s in scored if not s.correct]
-    if wrong:
-        lines += ["", "## Cases it got wrong", "",
-                  table(["Case", "Scenario", "Layout", "Expected", "Got"], [
-                      [s.truth.case_id, s.truth.scenario, s.truth.template or "-",
-                       f"{s.truth.expected_status} {sorted(s.truth.expected_failures)}", f"{s.status} {s.failures}"]
-                      for s in wrong
-                  ])]
-    return "\n".join(lines) + "\n"
-
-
-def make_extractor(name: str, store: EvidenceStore, truths, record: bool, replay: bool):
-    if name == "rules":
-        from app.extractors.rules import RuleBasedExtractor
-
-        return RuleBasedExtractor(store)
-    if name == "oracle":
-        return OracleExtractor(store, truths)
-    from app.llm import AnthropicAPI, RecordingAPI, ReplayAPI
-
-    api = ReplayAPI() if replay else (RecordingAPI(AnthropicAPI()) if record else AnthropicAPI())
-    if name == "claude":
-        from app.extractors.claude import ClaudeExtractor
-
-        return ClaudeExtractor(store, api)
-    if name == "claude-judge":
-        from app.extractors.claude_judge import ClaudeJudgeExtractor
-
-        return ClaudeJudgeExtractor(store, api)
-    raise SystemExit(f"unknown extractor {name}")
+        out += ["", "## Runs that stopped early", ""] + [f"- {error}: {n}" for error, n in errors.most_common()]
+    return "\n".join(out) + "\n"
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Evaluate an extractor on the labeled cases.")
-    parser.add_argument("--extractor", default="rules", choices=["rules", "oracle", "claude", "claude-judge"])
-    parser.add_argument("--cases", type=int, default=None, help="only the first N cases (cheaper live runs)")
-    parser.add_argument("--replay", action="store_true", help="answer from recordings; no API calls")
-    parser.add_argument("--record", action="store_true", help="save every live exchange for later replay")
-    parser.add_argument("--yes", action="store_true", help="confirm a live run that costs money")
-    parser.add_argument("--out", type=Path, default=None)
+    parser = argparse.ArgumentParser(description="Evaluate an extractor on the labeled vouching cases.")
+    parser.add_argument("--extractor", choices=["oracle", "rules", "claude"], required=True)
+    parser.add_argument("--split", choices=["dev", "heldout", "all"], default="heldout")
+    parser.add_argument("--profile", choices=["optimized", "baseline"], default="optimized")
+    parser.add_argument("--cases", type=int, help="only the first N cases of the split")
+    parser.add_argument("--record", action="store_true", help="live run that saves every request and response")
+    parser.add_argument("--replay", action="store_true", help="answer from the recordings only; no API key")
+    parser.add_argument("--yes", action="store_true", help="confirm a live run, which costs money")
+    parser.add_argument("--name", help="report name (default: from the extractor and profile)")
     args = parser.parse_args(argv)
 
     store, truths = EvidenceStore.load(), load_ground_truth()
-    cases = load_cases()[: args.cases]
-    live = args.extractor.startswith("claude") and not args.replay
-    if live and not args.yes:
-        low, high = ESTIMATED_COST_PER_CASE[args.extractor]
-        print(f"A live run calls the Claude API for {len(cases)} cases: roughly ${low * len(cases):.0f}-"
-              f"${high * len(cases):.0f}. Add --yes to go ahead (and --record to keep the responses).",
-              file=sys.stderr)
-        return 2
+    cases = [c for c in load_cases() if args.split == "all" or truths[c.case_id].split == args.split]
+    cases = cases[: args.cases] if args.cases else cases
+    name = args.name or (args.extractor if args.extractor != "claude" else f"claude-{args.profile}")
 
-    scored = evaluate(cases, truths, make_extractor(args.extractor, store, truths, args.record, args.replay), store)
-    text = report(scored, args.extractor, store)
-    out = args.out or Path("docs") / f"evaluation-{args.extractor}.md"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(text, encoding="utf-8")
-    print(text)
-    print(f"Written to {out}")
+    if args.extractor == "oracle":
+        extractor, details = OracleExtractor(truths), "Oracle: the true values, read perfectly"
+    elif args.extractor == "rules":
+        from app.extractors.rules import RuleBasedExtractor
+
+        extractor, details = RuleBasedExtractor(store), "Template baseline: fixed labels for layouts A and B, no AI"
+    else:
+        from app.extractors.claude import ClaudeExtractor
+        from app.llm import AnthropicAPI, RecordingAPI, ReplayAPI
+
+        if args.replay:
+            api = ReplayAPI()
+        else:
+            low, high = (len(cases) * c for c in ESTIMATED_COST_PER_CASE)
+            if not args.yes:
+                print(f"A live run of {len(cases)} cases calls the Claude API and costs money: roughly "
+                      f"${low:.2f}-${high:.2f}. Add --yes to run it (and --record to keep the answers).")
+                return 2
+            api = RecordingAPI(AnthropicAPI()) if args.record else AnthropicAPI()
+        extractor = ClaudeExtractor(store, api, profile=args.profile)
+        details = f"Claude ({extractor.model}, effort {extractor.effort}), {args.profile} retrieval"
+
+    scored = evaluate(cases, extractor, store, truths)
+    docs = ROOT / "docs"
+    (docs / "results").mkdir(parents=True, exist_ok=True)
+    (docs / f"evaluation-{name}.md").write_text(report(name, scored, args.split, details), encoding="utf-8")
+    (docs / "results" / f"{name}.json").write_text(json.dumps([s.record() for s in scored], indent=1), encoding="utf-8")
+    right, total = accuracy(scored)
+    print(f"{name}: {right}/{total} decisions right ({percent(right, total)}); wrote docs/evaluation-{name}.md")
     return 0
 
 

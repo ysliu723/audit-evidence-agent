@@ -1,40 +1,37 @@
-import pytest
+"""The template baseline reads the layouts it was written for, and breaks on the others."""
 
-from app.evidence import EvidenceStore, load_cases, load_ground_truth
+from app.checks import CHECK_CODES
 from app.extractors.rules import RuleBasedExtractor
 from app.pipeline import vouch
+from tests.helpers import case_for, cases, store, truths
 
 
-@pytest.fixture(scope="module")
-def results():
-    store = EvidenceStore.load()
-    extractor = RuleBasedExtractor(store)
-    truths = load_ground_truth()
-    return [(vouch(case, extractor, store), truths[case.case_id]) for case in load_cases()]
+def run(case):
+    return vouch(case, RuleBasedExtractor(store()), store())
 
 
-def test_reads_the_layouts_it_was_written_for(results):
-    for result, truth in results:
-        if truth.scenario == "SUPPORTED" and truth.template in ("A", "B"):
-            invoice = result.run.extraction.invoice
-            assert invoice.invoice_number.value == truth.invoice_number
-            assert invoice.total_amount.value == str(truth.total_amount)
-            assert result.report.status == "SUPPORTED", truth.case_id
+def test_every_dev_case_is_read_correctly():
+    wrong = []
+    for case_id, truth in truths().items():
+        if truth.split == "dev":
+            verdicts = run(cases()[case_id]).report.verdicts
+            wrong += [(case_id, c) for c in CHECK_CODES if verdicts[c] != truth.expected[c]]
+    assert wrong == []
 
 
-def test_cannot_read_the_layout_it_was_not_written_for(results):
-    layout_c = [(r, t) for r, t in results if t.scenario == "SUPPORTED" and t.template == "C"]
-    assert layout_c
-    assert all(r.report.status != "SUPPORTED" for r, _ in layout_c)
+def test_an_unseen_layout_gives_the_templates_nothing_to_read():
+    for layouts in ("C", "D"):
+        case, _ = case_for("supported" if layouts == "C" else "lookalike_vendor", layouts)
+        result = run(case)
+        assert result.run.findings.invoice is None
+        assert result.report.verdicts["VENDOR_IDENTITY"] == "UNABLE" and result.report.status == "NEEDS_REVIEW"
 
 
-def test_is_not_fooled_by_injected_instructions(results):
-    for result, truth in results:
-        if truth.scenario == "PROMPT_INJECTION" and truth.template in ("A", "B"):
-            assert result.run.extraction.invoice.total_amount.value == str(truth.total_amount)
-
-
-def test_records_the_searches_it_made(results):
-    result, _ = results[0]
-    assert result.run.tool_calls and result.run.tool_calls[0]["tool"] == "search_documents"
-    assert result.run.cost_usd == 0  # no model, no cost
+def test_it_picks_the_invoice_for_this_entry_when_the_folder_has_two():
+    for case_id, case in cases().items():
+        invoices = [d for d in case.documents if d.document_type == "INVOICE"]
+        truth = truths()[case_id]
+        if len(invoices) == 2 and truth.layout in "AB" and truth.facts["invoice_readable"]:
+            assert run(case).run.findings.invoice.document_id == truth.facts["invoice"]["document_id"]
+            return
+    raise AssertionError("no case with two invoices")
